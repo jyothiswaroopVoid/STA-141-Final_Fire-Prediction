@@ -3,6 +3,7 @@ title: "Predicting Notable Wildfire Incidence in the USA"
 subtitle: "STA 141A Final Project: Jyothiswaroop Makala"
 format:
   html:
+    self-contained: true
     toc: true
     toc-depth: 3
     number-sections: true
@@ -43,8 +44,9 @@ The modeling dataset is constructed by joining three sources:
 - **`wildfires`**: individual fire records with location (state, county FIPS), discovery
   date, and burned area
 - **`county_climate`**: monthly county-level temperature, precipitation, and drought index
-  (PDSI) from 1992–2015
+  (PDSI) from 1990–2016
 - **`county_land_cover`**: annual county-level land cover fractions from the NLCD
+  1992-2015
 
 The prediction task is a **binary classification** at the **county × month** level:
 did at least one notable wildfire occur?
@@ -56,7 +58,7 @@ Following operational wildfire reporting standards used by U.S. fire management 
 we define a **notable fire** as any fire with a final burned area of **≥ 300 acres**.
 This threshold corresponds to the standard for large wildland fires in grass or brush
 fuel models, and filters out the vast majority of small, quickly-contained fires that
-would otherwise create extreme class imbalance and obscure meaningful fire dynamics.
+would otherwise obscure the predictability of meaningful fire.
 
 ## Data Extraction
 
@@ -111,7 +113,9 @@ suppressMessages({
   library(RSQLite)
   library(maps)
   library(kableExtra)
-
+  library(patchwork)
+  library(ggforce)
+  library(DiagrammeR)
 })
 
 set.seed(141)
@@ -236,8 +240,6 @@ medium, and long-term fire history as additional predictors.
 ```{r}
 #| label: data-merge-diagram
 #| fig-cap: "Data merge diagram showing the three source datasets, the columns extracted from each, and how they are joined to form the final county × month panel."
-
-library(DiagrammeR)
 
 grViz("
 digraph data_merge {
@@ -372,9 +374,6 @@ Here is an example of what the county centroid and the county's landcover would 
 ```{r}
 #| label: county-profile-06113
 #| fig-cap: "Yolo County (FIPS 06113): county boundary with centroid and land cover composition "
-
-library(patchwork)
-library(ggforce)
 
 target_fips <- "06113"
 
@@ -992,6 +991,8 @@ To respect the temporal structure of the data and avoid data leakage, we use an
 - For each fold with training cutoff year $t$: train on all years $\leq t$, validate on year $t+1$
 - Minimum training window: 5 years (to ensure sufficient data before first evaluation)
 - This mirrors real-world deployment: the model only ever sees past data
+
+Class imbalance is addressed through downsampling: only 0.6% of county-month observations recorded a notable wildfire, meaning the training data is heavily skewed toward no-fire observations. To prevent the model from simply predicting "no fire" for every observation, the majority class (no fire) is randomly downsampled to a 5:1 ratio relative to the minority class (fire) in each training fold. This forces both models to learn meaningful distinctions between fire and no-fire county-months rather than exploiting the class imbalance.
 
 Setup
 ```{r}
