@@ -1,0 +1,1262 @@
+---
+title: "Predicting Notable Wildfire Incidence in the USA"
+subtitle: "STA 141A Final Project: Jyothiswaroop Makala"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-summary: "Show code"
+    fig-width: 8
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+## Abstract
+
+This report develops a predictive model for the monthly incidence of notable wildfires
+across U.S. counties from 1992 to 2015. Using a county-month panel dataset constructed
+from historical wildfire records, land cover data, and monthly climate measurements, we
+define a binary outcome indicating whether at least one wildfire of 300 or more acres
+occurred in a given county and month. We fit two models: a logistic regression baseline
+and a random forest. Models are evaluated using time-aware
+expanding-window cross-validation to prevent data leakage, and performance is assessed
+via the Area Under the ROC Curve (AUC). Our exploratory analysis reveals strong
+seasonality, pronounced geographic clustering in the western United States, and clear
+associations between fire incidence and drought, temperature, and land cover type.
+The random forest modestly outperforms logistic regression, with both models achieving
+meaningful predictive signal above chance.
+
+---
+
+# Data Preprocessing
+
+## Overview
+
+The modeling dataset is constructed by joining three sources:
+
+- **`wildfires`**: individual fire records with location (state, county FIPS), discovery
+  date, and burned area
+- **`county_climate`**: monthly county-level temperature, precipitation, and drought index
+  (PDSI) from 1992–2015
+- **`county_land_cover`**: annual county-level land cover fractions from the NLCD
+
+The prediction task is a **binary classification** at the **county × month** level:
+did at least one notable wildfire occur?
+
+
+## Notable Fire Cutoff
+
+Following operational wildfire reporting standards used by U.S. fire management agencies,
+we define a **notable fire** as any fire with a final burned area of **≥ 300 acres**.
+This threshold corresponds to the standard for large wildland fires in grass or brush
+fuel models, and filters out the vast majority of small, quickly-contained fires that
+would otherwise create extreme class imbalance and obscure meaningful fire dynamics.
+
+## Data Extraction
+
+- **`wildfires`**
+Wildfire records were sourced from the **1.88 Million US Wildfires** 
+dataset on **Kaggle**, derived from the **Fire Program Analysis Fire-Occurrence 
+Database (FPA-FOD)**, and loaded directly into R from the SQLite database 
+`FPA_FOD_20170508.sqlite`.
+
+- **`county_climate`**
+I obtained climate data from the **NOAA nClimDiv** database using an R script that 
+programmatically downloaded and parsed four county-level variables — `tmpc`, `tmax`, 
+`tmin`, and `pcpn` — directly from the **NOAA server**. Since **PDSI** is only 
+available at the **climate division level**, I joined it to the county data using 
+NOAA's official `county-to-climdivs.txt` crosswalk, mapping NOAA's internal state 
+codes to standard **5-digit Census FIPS** for consistent joining. The final output 
+`county_climate_1990_2016.csv` contains one row per **county-month** filtered to 
+**1992–2015**.
+
+- **`county_land_cover`**
+I got land cover data from the **National Land Cover Database (NLCD)** using 
+**Google Earth Engine (GEE)**. I wrote a Python script to extract **annual 
+county-level land cover fractions** from **1992 to 2015** by retrieving each year's 
+image from the `USGS/ANNUAL_NLCD/LANDCOVER` collection and computing, for each of 
+the **3,108 U.S. counties**, the fraction of area belonging to each of **16 land 
+cover classes** — including water, developed land, forest types, shrubland, cropland, 
+and wetlands. I created a binary indicator band per class, summed pixel counts within 
+county boundaries using `TIGER/2018/Counties` at **300-meter resolution** 
+(`EPSG:5070`), and divided by total valid pixels to obtain fractional coverage. 
+Results were exported annually to **Google Drive**, then merged into a single panel 
+`nlcd_county_1992_2015.csv` containing one row per **county-year** with 16 `frac_` 
+variables, which I joined to the climate and wildfire panel by `county_fips` and `year`.
+
+**Note:** All the datasets are available in the GitHub repository linked in this report.
+
+## Library & Data Loading
+
+Load all relevant Libraries
+```{r}
+#| code-fold: true
+
+suppressMessages({
+  library(doParallel)
+  library(foreach)
+  library(tidyverse)
+  library(slider)
+  library(pROC)
+  library(randomForest)
+  library(lubridate)
+  library(scales)
+  library(DBI)
+  library(RSQLite)
+  library(maps)
+  library(kableExtra)
+
+})
+
+set.seed(141)
+```
+
+Load Datasets
+```{r}
+#| label: load-data
+
+# --- Load your three datasets here ---
+con <- dbConnect(SQLite(),
+                 "/Users/jyothiswaroopmakala/Downloads/STA141 Wildfire/Data/FPA_FOD_20170508.sqlite")
+wildfires <- tbl(con, "Fires") |> collect()
+county_climate <- read_csv("/Users/jyothiswaroopmakala/Downloads/STA141 Wildfire/Data/county_climate_1990_2016.csv")
+county_land_cover <- read_csv("/Users/jyothiswaroopmakala/Downloads/STA141 Wildfire/Data/nlcd_county_1992_2015.csv")
+
+```
+
+```{r}
+#| label: dataset-columns-table
+
+tibble(
+  `Wildfires` = c(
+    "Object ID", "Fire Occurrence ID", "FPA Fire ID", "Source System Type",
+    "Source System", "NWCG Reporting Agency", "NWCG Reporting Unit ID",
+    "NWCG Reporting Unit Name", "Source Reporting Unit", "Source Reporting Unit Name",
+    "Local Fire Report ID", "Local Incident ID", "Fire Code", "Fire Name",
+    "ICS-209 Incident Number", "ICS-209 Name", "MTBS ID", "MTBS Fire Name",
+    "Complex Name", "Fire Year", "Discovery Date", "Discovery Day of Year",
+    "Discovery Time", "Cause Code", "Cause Description",
+    "Containment Date", "Containment Day of Year", "Containment Time",
+    "Fire Size (acres)", "Fire Size Class", "Latitude", "Longitude",
+    "Owner Code", "Owner Description", "State", "County", "County FIPS Code",
+    "FIPS Name", "Shape"
+  ),
+  `County Climate` = c(
+    "County FIPS Code", "State Name", "Climate Division ID", "Year", "Month Number",
+    "Month", "Date", "Mean Temperature", "Max Temperature", "Min Temperature",
+    "Precipitation", "Drought Index (PDSI)",
+    rep("", 27)
+  ),
+  `County Land Cover` = c(
+    "County FIPS Code", "Year", "Fraction Water", "Fraction Ice/Snow",
+    "Fraction Developed Open", "Fraction Developed Low", "Fraction Developed Medium",
+    "Fraction Developed High", "Fraction Barren", "Fraction Deciduous Forest",
+    "Fraction Evergreen Forest", "Fraction Mixed Forest", "Fraction Shrubland",
+    "Fraction Herbaceous", "Fraction Hay/Pasture", "Fraction Cropland",
+    "Fraction Woody Wetland", "Fraction Emergent Wetland",
+    rep("", 21)
+  )
+) %>%
+  knitr::kable(caption = "Columns in each source dataset") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "left"
+  ) %>%
+  row_spec(0, bold = TRUE)
+```
+
+
+
+
+## Filtering and Aggregating Wildfires
+
+The raw wildfire records are filtered to **notable fires** (≥ 300 acres), 
+calendar dates are reconstructed from `FIRE_YEAR` and `DISCOVERY_DOY`, and 
+county identifiers are standardized to **5-digit Census FIPS** codes. The 
+filtered records are then collapsed to a **county-month panel** where each 
+row represents a unique county-month in which at least one notable fire was 
+recorded.
+
+```{r}
+#| label: preprocess-fires
+# Step 1: Filter notable fires (>= 300 acres) and extract year/month
+fires_notable <- wildfires %>%
+  filter(FIRE_SIZE >= 300) %>%
+  mutate(
+    # Use FIRE_YEAR + DISCOVERY_DOY to build calendar date
+    discovery_date2 = as.Date(paste0(FIRE_YEAR, "-01-01")) +
+                      days(DISCOVERY_DOY - 1),
+    year      = FIRE_YEAR,
+    month_num = month(discovery_date2),
+    # Standardize FIPS: STATE (2-digit) + COUNTY (3-digit) -> 5-char string
+    county_fips = str_pad(as.character(as.integer(
+                    paste0(str_pad(as.character(as.integer(
+                      match(STATE, state.abb))), 2, pad = "0"),
+                      str_pad(FIPS_CODE, 3, pad = "0")))),
+                    5, pad = "0")
+  ) %>%
+  filter(!is.na(county_fips), !is.na(year), !is.na(month_num))
+
+# Step 2: Collapse to county-month binary outcome
+# y = 1 if at least one notable fire occurred
+fire_panel <- fires_notable %>%
+  group_by(county_fips, year, month_num) %>%
+  summarise(
+    fire_count    = n(),
+    max_fire_size = max(FIRE_SIZE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    fire_occurred = 1L,
+    # Ensure county_fips is character zero-padded (matches climate spine)
+    county_fips = str_pad(county_fips, width = 5, pad = "0")
+  )
+```
+
+
+## Building the Full County-Month Panel
+
+A **panel is created** so that — every county-month combination is represented, 
+with `fire_occurred = 0` assigned to any county-month with no recorded notable 
+fire. **Land Cover** fractions are matched to each year using the nearest 
+available NLCD survey year. The **County Centroids** are computed and 
+joined to the panel, adding latitude and longitude as geographic 
+predictors.At the end we add **Fire Rolling History** that computes lagged 3, 6, and 12-month 
+rolling averages of past fire activity for each county, capturing short, 
+medium, and long-term fire history as additional predictors.
+
+
+```{r}
+#| label: data-merge-diagram
+#| fig-cap: "Data merge diagram showing the three source datasets, the columns extracted from each, and how they are joined to form the final county × month panel."
+
+library(DiagrammeR)
+
+grViz("
+digraph data_merge {
+
+  graph [rankdir=TB, fontname='Helvetica', splines=ortho, nodesep=0.6]
+  node  [fontname='Helvetica', fontsize=11, shape=record, style=filled]
+  edge  [fontname='Helvetica', fontsize=10]
+
+  wildfires [
+    fillcolor='#FAECE7', color='#D85A30',
+    label='{wildfires | State\\lCounty FIPS Code\\lFire Year\\lDiscovery Day of Year\\lFire Size (acres)\\l}'
+  ]
+
+  climate [
+    fillcolor='#E6F1FB', color='#185FA5',
+    label='{county_climate (spine) | County FIPS Code\\lYear / Month Number\\lMean Temperature\\lMax / Min Temperature\\lPrecipitation\\lDrought Index (PDSI)\\l}'
+  ]
+
+  land [
+    fillcolor='#E1F5EE', color='#0F6E56',
+    label='{county_land_cover | County FIPS Code\\lYear\\lLand Cover Fractions (16 classes)\\l}'
+  ]
+
+  panel [
+    fillcolor='#EEEDFE', color='#534AB7', penwidth=2,
+    label='{panel (county x month) | County FIPS Code, State Name\\lYear, Month Number\\lMean / Max / Min Temperature, Precipitation, Drought Index\\lLand Cover Fractions (16 classes)\\lCounty Centroid Latitude / Longitude\\lFire Occurred (0/1)\\l3 / 6 / 12-Month Rolling Fire Rate\\lNext Month Fire Outcome (target)\\l}'
+  ]
+
+  wildfires -> panel [label='left join (fips + year + month)', color='#D85A30', fontcolor='#D85A30']
+  climate   -> panel [label='spine',                           color='#185FA5', fontcolor='#185FA5']
+  land      -> panel [label='left join (fips + nearest year)', color='#0F6E56', fontcolor='#0F6E56']
+}
+")
+```
+
+
+Builds Panel
+```{r}
+#| label: build-panel
+
+# Step 3: Build the complete county-month grid from climate data
+# (climate already covers all counties x months; use as the spine)
+panel_base <- county_climate %>%
+  select(county_fips, state_name, year, month_num, 
+         tmpc, tmax, tmin, pcpn, pdsi) %>%
+  filter(year >= 1992, year <= 2015)
+
+# Step 4: Join wildfire outcome (left join → unobserved = no fire)
+panel <- panel_base %>%
+  left_join(fire_panel, by = c("county_fips", "year", "month_num")) %>%
+  mutate(
+    fire_occurred = replace_na(fire_occurred, 0L),
+    fire_count    = replace_na(fire_count, 0L)
+  )
+
+# Step 5: Join land cover (annual; join on county_fips + year)
+# NLCD updates infrequently — forward-fill to all years
+land_years <- sort(unique(county_land_cover$year))
+
+# Coerce county_land_cover$county_fips to character and zero-pad to 5 digits
+land_cover_clean <- county_land_cover %>%
+  mutate(county_fips = str_pad(as.character(as.integer(county_fips)),
+                               width = 5, pad = "0"))
+
+panel <- panel %>%
+  mutate(lc_year = map_int(year, ~ land_years[which.min(abs(land_years - .x))])) %>%
+  left_join(
+    land_cover_clean %>% rename(lc_year = year),
+    by = c("county_fips", "lc_year")
+  ) %>%
+  select(-lc_year)
+
+panel_full <- panel
+```
+
+Creates County-Centroids
+```{r}
+#| label: county-centroids
+
+county_centroids <- map_data("county") %>%
+  mutate(polyname = paste(region, subregion, sep = ",")) %>%
+  left_join(
+    maps::county.fips %>%
+      mutate(county_fips = str_pad(as.character(fips), 5, pad = "0")) %>%
+      select(polyname, county_fips),
+    by = "polyname"
+  ) %>%
+  group_by(county_fips) %>%
+  summarise(
+    centroid_lat = mean(lat),
+    centroid_lon = mean(long),
+    .groups = "drop"
+  )
+
+panel <- panel %>%
+  left_join(county_centroids, by = "county_fips")
+```
+
+Creates Rolling Fire Rate
+```{r}
+#| label: rolling-fire
+
+# Step 7: Rolling fire rate per county at 3, 6, and 12-month windows (lagged — no leakage)
+# Captures short-, medium-, and long-term fire history in each county
+panel <- panel %>%
+  arrange(county_fips, year, month_num) %>%
+  group_by(county_fips) %>%
+  mutate(
+    fire_roll3 = slide_dbl(
+      fire_occurred,
+      mean,
+      .before = 3, .after = -1,   # lag: excludes current month, 3-month window
+      .complete = FALSE
+    ),
+    fire_roll6 = slide_dbl(
+      fire_occurred,
+      mean,
+      .before = 6, .after = -1,   # lag: excludes current month, 6-month window
+      .complete = FALSE
+    ),
+    fire_roll12 = slide_dbl(
+      fire_occurred,
+      mean,
+      .before = 12, .after = -1,  # lag: excludes current month, 12-month window
+      .complete = FALSE
+    )
+  ) %>%
+  ungroup()
+```
+
+Here is an example of what the county centroid and the county's landcover would look like
+```{r}
+#| label: county-profile-06113
+#| fig-cap: "Yolo County (FIPS 06113): county boundary with centroid and land cover composition "
+
+library(patchwork)
+library(ggforce)
+
+target_fips <- "06113"
+
+# --- County boundary ---
+county_map <- map_data("county") %>%
+  mutate(polyname = paste(region, subregion, sep = ",")) %>%
+  left_join(
+    maps::county.fips %>%
+      mutate(county_fips = str_pad(as.character(fips), 5, pad = "0")) %>%
+      select(polyname, county_fips),
+    by = "polyname"
+  ) %>%
+  filter(county_fips == target_fips)
+
+centroid <- county_centroids %>% filter(county_fips == target_fips)
+
+p_map <- ggplot(county_map, aes(long, lat, group = group)) +
+  geom_polygon(fill = "#EEEDFE", color = "#534AB7", linewidth = 0.6) +
+  geom_point(data = centroid,
+             aes(x = centroid_lon, y = centroid_lat, group = NULL),
+             color = "#534AB7", size = 3, shape = 16) +
+  geom_text(data = centroid,
+            aes(x = centroid_lon, y = centroid_lat, group = NULL,
+                label = "centroid"),
+            vjust = -1, size = 3, color = "#534AB7") +
+  coord_map() +
+  labs(title = "Yolo County (FIPS 06113)", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(
+    axis.text       = element_blank(),
+    axis.ticks      = element_blank(),
+    panel.grid      = element_blank(),
+    plot.title      = element_text(face = "bold", size = 11)
+  )
+
+# --- Land cover pie chart ---
+lc_labels <- c(
+  frac_water            = "Water",
+  frac_ice_snow         = "Ice / Snow",
+  frac_dev_open         = "Developed Open",
+  frac_dev_low          = "Developed Low",
+  frac_dev_med          = "Developed Medium",
+  frac_dev_high         = "Developed High",
+  frac_barren           = "Barren",
+  frac_forest_dec       = "Deciduous Forest",
+  frac_forest_eve       = "Evergreen Forest",
+  frac_forest_mix       = "Mixed Forest",
+  frac_shrub            = "Shrubland",
+  frac_herbaceous       = "Herbaceous",
+  frac_hay_pasture      = "Hay / Pasture",
+  frac_crops            = "Cropland",
+  frac_wetland_woody    = "Woody Wetland",
+  frac_wetland_emergent = "Emergent Wetland"
+)
+
+lc_colors <- c(
+  "Water"            = "#4A90D9",
+  "Ice / Snow"       = "#D6EAF8",
+  "Developed Open"   = "#F0A500",
+  "Developed Low"    = "#E07B00",
+  "Developed Medium" = "#C05A00",
+  "Developed High"   = "#8B3A00",
+  "Barren"           = "#C8B89A",
+  "Deciduous Forest" = "#2ECC71",
+  "Evergreen Forest" = "#1A7A40",
+  "Mixed Forest"     = "#58D68D",
+  "Shrubland"        = "#A9C934",
+  "Herbaceous"       = "#D4E157",
+  "Hay / Pasture"    = "#F9E79F",
+  "Cropland"         = "#F7DC6F",
+  "Woody Wetland"    = "#6C8EBF",
+  "Emergent Wetland" = "#A8C8E8"
+)
+
+lc_data <- panel %>%
+  filter(county_fips == target_fips) %>%
+  slice(1) %>%
+  select(all_of(names(lc_labels))) %>%
+  pivot_longer(everything(), names_to = "frac_var", values_to = "value") %>%
+  mutate(label = lc_labels[frac_var]) %>%
+  filter(value > 0.01)
+
+p_pie <- ggplot(lc_data, aes(x = 0, y = value, fill = label)) +
+  geom_col(width = 1, color = "white", linewidth = 0.3) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = lc_colors, name = "Land Cover") +
+  labs(title = "Land Cover Composition") +
+  theme_void() +
+  theme(
+    plot.title      = element_text(face = "bold", size = 11, hjust = 0.5),
+    legend.text     = element_text(size = 8),
+    legend.title    = element_text(size = 9, face = "bold"),
+    legend.key.size = unit(0.4, "cm")
+  )
+
+p_map + p_pie + plot_layout(widths = c(1, 1.4))
+```
+
+## Handling Missing Data
+Missing values are addressed through two targeted imputation strategies: land cover fractions with no NLCD record are filled with 0, and missing climate variables are replaced with the county's past-years median for that specific month to avoid data leakage. Any rows still missing key predictors after imputation are dropped, ensuring a complete dataset for modeling.
+```{r}
+#| label: missing-data
+
+# Replace NA land cover fractions with 0 (county had no NLCD record)
+lc_cols <- names(panel)[str_starts(names(panel), "frac_")]
+panel <- panel %>%
+  mutate(across(all_of(lc_cols), ~ replace_na(.x, 0)))
+
+# Replace NA climate with county-month median of past years only (no leakage)
+panel <- panel %>%
+  arrange(county_fips, month_num, year) %>%
+  group_by(county_fips, month_num) %>%
+  mutate(across(c(tmpc, tmax, tmin, pcpn, pdsi),
+                ~ ifelse(is.na(.x),
+                         slide_dbl(.x, ~ median(.x, na.rm = TRUE),
+                                   .before = Inf, .after = -1,
+                                   .complete = FALSE),
+                         .x))) %>%
+  ungroup()
+
+# Drop rows still missing after imputation (very few)
+panel <- panel %>% drop_na(tmpc, pcpn, pdsi, fire_roll3, fire_roll6, fire_roll12, centroid_lat, centroid_lon)
+```
+
+## Final Modeling Dataset
+
+```{r}
+#| label: model-df
+
+# All possible predictors for modeling
+model_df <- panel %>%
+  transmute(
+    county_fips,
+    state_name,
+    year,
+    month_num,
+    month_sin = sin(2 * pi * month_num / 12),  # <-- compute directly here
+    month_cos = cos(2 * pi * month_num / 12),  # <-- compute directly here
+    # Climate predictors
+    tmpc, tmax, tmin, pcpn, pdsi,
+    # Geographic Predictors
+    centroid_lat, centroid_lon,
+    # Key land cover predictors
+    frac_water,
+    frac_ice_snow,
+    frac_dev_open,
+    frac_dev_low,
+    frac_dev_med,
+    frac_dev_high,
+    frac_barren,
+    frac_forest_dec,
+    frac_forest_eve,
+    frac_forest_mix,
+    frac_shrub,
+    frac_herbaceous,
+    frac_hay_pasture,
+    frac_crops,
+    frac_wetland_woody,
+    frac_wetland_emergent,
+    # Lagged fire history (3-, 6-, and 12-month rolling means)
+    fire_roll3,
+    fire_roll6,
+    fire_roll12,
+    # Outcome
+    y = as.factor(fire_occurred)
+  ) %>%
+  # Predict NEXT month's fire — shift outcome forward by 1 month
+  group_by(county_fips) %>%
+  arrange(year, month_num) %>%
+  mutate(y_next = lead(y)) %>%
+  ungroup() %>%
+  drop_na(y_next)
+
+glimpse(model_df)
+```
+
+## Dataset Summary Table
+
+```{r}
+#| label: summary-table
+
+tibble(
+  Property = c(
+    "Spatial unit",
+    "Temporal unit", 
+    "Years covered",
+    "Total observations",
+    "Fire observations (y = 1)",
+    "No-fire observations (y = 0)",
+    "Class balance (% fire)",
+    "Fire size cutoff",
+    "Climate predictors",
+    "Land cover predictors",
+    "Lagged fire predictors",
+    "Geographic predictors"
+  ),
+  Value = c(
+    "U.S. County (FIPS)",
+    "Month",
+    paste(min(model_df$year), "–", max(model_df$year)),
+    format(nrow(model_df), big.mark = ","),
+    format(sum(model_df$y_next == 1), big.mark = ","),
+    format(sum(model_df$y_next == 0), big.mark = ","),
+    paste0(round(mean(model_df$y_next == 1) * 100, 2), "%"),
+    "≥ 300 acres",
+    "tmpc, tmax, tmin, pcpn, pdsi, month_sin, month_cos",
+    "frac_forest_eve, frac_forest_mix, frac_shrub, frac_wetland_woody, frac_water, frac_dev_open, frac_dev_high, frac_crops",
+    "fire_roll3, fire_roll6, fire_roll12",
+    "centroid_lat, centroid_lon"
+  )
+) %>%
+  knitr::kable(
+    caption = "Summary of final modeling dataset",
+    align = c("l", "l")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    position          = "left"
+  ) %>%
+  kableExtra::row_spec(0, bold = TRUE) %>%
+  kableExtra::pack_rows("Dataset Overview",   1, 8) %>%
+  kableExtra::pack_rows("Possible Predictors",   9, 12)
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Spatial Distribution of Notable Wildfires
+
+```{r}
+#| label: eda-spatial
+#| fig-cap: "Total notable wildfire count by county (1992–2015). Fire incidence is geographically concentrated but not exclusively western — while California, the Rocky Mountain region, and the inland Pacific Northwest show the highest county-level fire counts, a secondary cluster is clearly visible across the Sout, particularly Florida, Missisippi, Lousiana, Texas. The majority of counties across the Great Plains and into the Mid-West recorded few or no notable fires over the 24-year period, consistent with higher precipitation and lower fuel aridity in those regions. So geographical indicators such as latitude and longitude would make good predictors as the fires tend to cluster to specific regions within the country. A key feature to note is that the counties are small on the eastern side of the country and are starkly much bigger on the western side."
+
+fires_by_county <- fires_notable %>%
+  filter(year >= 1992, year <= 2015) %>%
+  count(county_fips, name = "n_fires")
+
+# Build county map with FIPS via maps::county.fips
+us_counties <- map_data("county") %>%
+  mutate(polyname = paste(region, subregion, sep = ",")) %>%
+  left_join(
+    maps::county.fips %>%
+      mutate(county_fips = str_pad(as.character(fips), 5, pad = "0")) %>%
+      select(polyname, county_fips),
+    by = "polyname"
+  ) %>%
+  left_join(fires_by_county, by = "county_fips")
+
+ggplot(us_counties, aes(long, lat, group = group, fill = n_fires)) +
+  geom_polygon(color = "white", linewidth = 0.08) +
+  coord_map("albers", lat0 = 39, lat1 = 45) +
+  scale_fill_distiller(
+    palette   = "YlOrRd",
+    direction = 1,
+    na.value  = "grey88",
+    trans     = "sqrt",
+    labels    = comma,
+    name      = "# Notable\nFires"
+  ) +
+  labs(
+    title    = "Notable Wildfire Incidence by County (1992–2015)",
+    subtitle = "Fires ≥ 300 acres  |  Color scale is square-root transformed",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text  = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+```
+
+## Seasonality of Wildfire Incidence
+
+```{r}
+#| label: eda-seasonality
+#| fig-cap: "Monthly distribution of notable wildfire occurrences across all U.S. counties (1992–2015). Fire incidence peaks sharply in summer months (June–Jul), driven by hot, dry conditions. A secondary peak is visible in spring (March–April). This strong seasonality motivates inclusion of cyclical month encodings (sin/cos) as model features."
+
+model_df %>%
+  filter(y_next == 1) %>%
+  count(month_num) %>%
+  mutate(month_label = month.abb[month_num]) %>%
+  ggplot(aes(x = factor(month_num), y = n, fill = n)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_discrete(labels = month.abb) +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Seasonality of Notable Wildfire Incidence",
+    subtitle = "County-month observations with fire_next = 1",
+    x = "Month", y = "Number of fire observations"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#| label: eda-trend
+#| fig-cap: "Annual wildfire incidence rate and mean PDSI (1992–2015) plotted ona dual axis. The inverse relationship between the two series is clearly visible —drought troughs in PDSI (right axis, blue) closely precede or coincide with fire incidence peaks (left axis, red), most visibly in 2006 and 2012. This co-movement validates PDSI as a key predictor of notable wildfire occurrence."
+
+yearly_df <- model_df %>%
+  group_by(year) %>%
+  summarise(
+    fire_rate = mean(y_next == 1),
+    mean_pdsi = mean(pdsi, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Scale PDSI to fire_rate range for dual axis
+pdsi_scale <- function(x) {
+  fire_range <- range(yearly_df$fire_rate)
+  pdsi_range <- range(yearly_df$mean_pdsi)
+  (x - pdsi_range[1]) / diff(pdsi_range) * diff(fire_range) + fire_range[1]
+}
+
+pdsi_unscale <- function(x) {
+  fire_range <- range(yearly_df$fire_rate)
+  pdsi_range <- range(yearly_df$mean_pdsi)
+  (x - fire_range[1]) / diff(fire_range) * diff(pdsi_range) + pdsi_range[1]
+}
+
+ggplot(yearly_df, aes(x = year)) +
+  geom_line(aes(y = fire_rate), color = "firebrick", linewidth = 1) +
+  geom_point(aes(y = fire_rate), color = "firebrick", size = 2) +
+  geom_line(aes(y = pdsi_scale(mean_pdsi)),
+            color = "lightblue", linewidth = 0.5) +
+  geom_point(aes(y = pdsi_scale(mean_pdsi)),
+             color = "lightblue", size = 1) +
+  scale_x_continuous(breaks = seq(1992, 2015, 2)) +
+  scale_y_continuous(
+    name   = "Fire incidence rate",
+    labels = percent_format(accuracy = 0.1),
+    sec.axis = sec_axis(
+      transform = ~ pdsi_unscale(.),
+      name      = "Mean PDSI (Drought Index)"
+    )
+  ) +
+  labs(
+    title    = "Annual Wildfire Incidence Rate and Drought Index (1992–2015)",
+    x        = "Year"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title.y.left  = element_text(color = "firebrick", face = "bold"),
+    axis.text.y.left   = element_text(color = "firebrick"),
+    axis.title.y.right = element_text(color = "lightblue", face = "bold"),
+    axis.text.y.right  = element_text(color = "lightblue"),
+    axis.text.x        = element_text(angle = 45, hjust = 1)
+  )
+```
+
+
+## Land-cover Predictors: Fire vs. No-Fire
+
+```{r}
+#| label: eda-landcover-correlation
+#| fig-cap: "Pearson correlation of land cover type with wildfire incidence. Wetland woody, water, and mixed forest show the strongest positive associations, likely reflecting geographic co-location with fire-prone forested landscapes in the Pacific Northwest and Southeast rather than a direct causal relationship. Shrubland and cropland show the strongest negative associations — shrubland fires tend to be smaller and more localized, frequently falling below the 300-acre threshold used to define notable fires, while cropland counties are typically flat, actively managed agricultural areas where large uncontrolled fires are rare. These patterns suggest the 300-acre cutoff selectively captures fires in densely forested landscapes rather than open or agricultural terrain. Even if the correlation is relatively low removing these predictors has a significant effect on AUC"
+
+panel_full %>%
+  summarise(across(starts_with("frac_"),
+                   ~ cor(.x, fire_occurred, use = "complete.obs"))) %>%
+  pivot_longer(everything(),
+               names_to  = "cover_type",
+               values_to = "correlation") %>%
+  mutate(
+    cover_type = str_remove(cover_type, "frac_"),
+    cover_type = str_replace_all(cover_type, "_", " "),
+    cover_type = str_to_title(cover_type),
+    direction  = ifelse(correlation > 0, "Positive", "Negative")
+  ) %>%
+  arrange(correlation) %>%
+  mutate(cover_type = fct_reorder(cover_type, correlation)) %>%
+  ggplot(aes(x = correlation, y = cover_type, fill = direction)) +
+  geom_col(show.legend = FALSE) +
+  geom_vline(xintercept = 0, linewidth = 0.5) +
+  scale_fill_manual(values = c("Positive" = "firebrick", "Negative" = "steelblue")) +
+  labs(
+    title = "Correlation of Land Cover Type with Wildfire Incidence",
+    x     = "Pearson correlation with fire occurrence",
+    y     = NULL
+  ) +
+  theme_minimal()
+```
+
+
+
+## Climate Predictors: Fire vs. No-Fire
+
+```{r}
+#| label: eda-climate
+#| fig-cap: "Density distributions of key climate variables for fire and no-fire county-months. Fire observations are strongly shifted toward higher temperatures, with the fire distribution peaking near 75°F compared to a broader, lower no-fire distribution — confirming heat as a clear separator between fire and no-fire conditions. PDSI shows a bimodal structure in both groups, but fire observations are slightly shifted toward negative values (drier conditions), suggesting drought amplifies fire risk but is not a strict prerequisite. Precipitation distributions are nearly identical between the two groups, indicating that monthly rainfall alone is a weak discriminator of notable fire occurrence."
+
+model_df %>%
+  select(y_next, tmpc, pcpn, pdsi) %>%
+  pivot_longer(-y_next, names_to = "variable", values_to = "value") %>%
+  mutate(
+    fire = ifelse(y_next == 1, "Fire", "No Fire"),
+    variable = recode(variable,
+      tmpc = "Mean Temp (°F)",
+      pcpn = "Precipitation (in)",
+      pdsi = "PDSI (Drought Index)"
+    )
+  ) %>%
+  ggplot(aes(x = value, fill = fire)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~variable, scales = "free") +
+  scale_fill_manual(values = c("firebrick", "steelblue")) +
+  labs(
+    title = "Climate Variable Distributions: Fire vs. No-Fire Observations",
+    x = "Value", y = "Density", fill = NULL
+  ) +
+  theme_minimal()
+```
+
+
+---
+
+# Modeling
+
+## Predictor and Response Specification
+
+The **response variable** is `y_next`: a binary indicator equal to 1 if at least one
+notable wildfire (≥ 300 acres) occurred in a given county during the *following* month.
+Using the next month's outcome while conditioning on the current month's predictors
+creates a genuine forecasting setup and prevents data leakage.
+
+Removed land-cover predictors that accounted for less than 1% correlation, and removed precipitation predictor because the density distribution between the fire and no-fires is identical to prevent the dataset from being too noisy for the model to accurately predict fires.
+
+**Predictors** used in both models:
+
+| Predictor | Type | Rationale |
+|---|---|---|
+| `month_sin`, `month_cos` | Cyclical | Captures smooth seasonal fire patterns without overfitting to specific months |
+| `tmpc`, `tmax`, `tmin` | Climate | Temperature & heat drives fuel drying and fire spread |
+| `pdsi` | Climate | Drought index — integrates moisture deficit over time |
+| `centroid_lat`, `centroid_lon` | Geographic | Geographic coordinates capture regional fire regimes and the West-East ecological gradient |
+| `frac_forest_eve` | Geographic | Evergreen forest — high-density fuel load, concentrated in fire-prone western landscapes |
+| `frac_forest_mix` | Geographic | Mixed forest — transitional fuel type between evergreen and deciduous cover |
+| `frac_wetland_woody` | Geographic | Woody wetland — geographically co-located with fire-prone forested regions |
+| `frac_water` | Geographic | Water fraction — geographic proxy for fire-adjacent counties |
+| `frac_dev_open` | Geographic | Open developed land — wildland-urban interface proxy where human ignition risk is elevated |
+| `frac_dev_high` | Geographic | High-intensity developed land |
+| `frac_crops` | Geographic | Cropland — actively managed land with low notable fire probability |
+| `frac_shrub` | Geographic | Shrubland — Similar to barren-land with low large-fire risk |
+| `fire_roll3` | Lagged | 3-month lagged fire rate — captures acute short-term fire activity |
+| `fire_roll6` | Lagged | 6-month lagged fire rate — captures medium-term fire history |
+| `fire_roll12` | Lagged | 12-month lagged fire rate — captures persistent long-term county fire proneness |
+
+```{r}
+#| label: predictor-correlation
+#| fig-cap: "Pearson correlation matrix of static climate and land cover predictors. Couple patterns stand out: (1) temperature variables (Temp Mean, Max, Min) are nearly perfectly collinear (r = .97–.99), suggesting they carry largely redundant signal; (2) longitude and shrubland fraction are strongly negatively correlated (r = -.51), reflecting the West-East ecological gradient where western counties have substantially more shrubland cover"
+
+static_features <- c(
+  "centroid_lat", "centroid_lon",
+  "tmpc", "tmax", "tmin", "pcpn", "pdsi",
+  "frac_forest_eve", "frac_forest_dec", "frac_forest_mix",
+  "frac_shrub", "frac_herbaceous",
+  "frac_crops", "frac_hay_pasture",
+  "frac_dev_open", "frac_dev_low", "frac_dev_med", "frac_dev_high",
+  "frac_wetland_woody", "frac_water", "frac_barren"
+)
+
+clean_labels <- c(
+  "Lat", "Lon",
+  "Temp Mean", "Temp Max", "Temp Min", "Precip", "PDSI",
+  "Forest Eve", "Forest Dec", "Forest Mix",
+  "Shrub", "Herbaceous",
+  "Crops", "Hay/Pasture",
+  "Dev Open", "Dev Low", "Dev Med", "Dev High",
+  "Wetland Woody", "Water", "Barren"
+)
+
+cor_matrix <- model_df %>%
+  select(all_of(static_features)) %>%
+  cor(use = "complete.obs")
+
+colnames(cor_matrix) <- clean_labels
+rownames(cor_matrix) <- clean_labels
+
+cor_long <- cor_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "correlation") %>%
+  mutate(
+    var1    = factor(var1, levels = clean_labels),
+    var2    = factor(var2, levels = clean_labels),
+    row_idx = as.integer(var1),
+    col_idx = as.integer(var2)
+  ) %>%
+  filter(row_idx >= col_idx) %>%
+  mutate(
+    label      = gsub("^0\\.", ".", gsub("^-0\\.", "-.", sprintf("%.2f", correlation))),
+    text_color = ifelse(abs(correlation) > 0.55, "white", "grey20")
+  )
+
+ggplot(cor_long, aes(x = var2, y = fct_rev(var1), fill = correlation)) +
+  geom_tile(color = "#1a1a2e", linewidth = 0.6) +
+  geom_text(aes(label = label, color = text_color),
+            size = 2.3, fontface = "bold") +
+  scale_color_identity() +
+  scale_fill_gradientn(
+    colors = c("#2193b0", "#6dd5ed", "#ffffff", "#f7971e", "#f44336"),
+    values = scales::rescale(c(-1, -0.3, 0, 0.3, 1)),
+    limits = c(-1, 1),
+    name   = "Pearson\nCorr",
+    guide  = guide_colorbar(
+      barwidth       = 0.8,
+      barheight      = 12,
+      ticks          = FALSE,
+      title.position = "top",
+      title.hjust    = 0.5
+    )
+  ) +
+  scale_x_discrete(position = "bottom") +
+  labs(
+    title    = "Predictor Correlation Matrix",
+    subtitle = "Static climate and land cover features only",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.background  = element_rect(fill = "#fafafa", color = NA),
+    panel.background = element_rect(fill = "#fafafa", color = NA),
+    plot.title       = element_text(face = "bold", hjust = 0.5,
+                                    size = 13, color = "#1a1a2e"),
+    plot.subtitle    = element_text(hjust = 0.5, color = "grey50", size = 9),
+    axis.text.x      = element_text(angle = 45, hjust = 1,
+                                    size = 8, color = "#1a1a2e"),
+    axis.text.y      = element_text(size = 8, color = "#1a1a2e"),
+    panel.grid       = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 8, color = "#1a1a2e", face = "bold"),
+    legend.text      = element_text(size = 7, color = "#1a1a2e")
+  )
+```
+
+
+
+
+```{r}
+#| label: feature-setup
+
+features <- c("month_sin", "month_cos",
+              "tmpc", "tmax", "tmin", "pdsi",
+              "centroid_lat", "centroid_lon",
+              "frac_wetland_woody", "frac_water", "frac_forest_mix", "frac_dev_high", "frac_forest_eve", "frac_dev_open",
+              "frac_crops", "frac_shrub",
+              "fire_roll3", "fire_roll6", 
+              "fire_roll12")
+
+target <- "y_next"
+
+feat_formula <- as.formula(
+  paste(target, "~", paste(features, collapse = " + "))
+)
+```
+
+## Baseline Model: Logistic Regression
+
+Logistic regression models the log-odds of a notable wildfire occurring as a linear
+combination of predictors:
+
+$$
+\log \frac{P(Y=1 \mid \mathbf{x})}{1 - P(Y=1 \mid \mathbf{x})} = \beta_0 + \beta_1 \cdot \texttt{month\_sin} + \beta_2 \cdot \texttt{month\_cos} + \cdots + \beta_{p-2} \cdot \texttt{fire\_roll3} + \beta_{p-1} \cdot \texttt{fire\_roll6} + \beta_p \cdot \texttt{fire\_roll12}
+$$
+
+This model is interpretable (each $\hat{\beta}_j$ gives a log-odds change per unit
+increase in predictor $j$), fast to fit, and serves as a strong, transparent benchmark.
+It assumes predictors act additively on the log-odds scale — a useful simplification
+that may underfit complex nonlinear interactions (e.g., combined drought + heat + fuel load).
+
+## Second Model: Random Forest
+
+The random forest relaxes the linearity assumption by fitting an ensemble of decision
+trees on bootstrapped subsets of the data and averaging their predictions. Each tree
+splits on a random subset of predictors at each node, reducing correlation among trees
+and improving generalization. Formally, the predicted probability is:
+
+
+$$
+\hat{y} = \frac{1}{B} \sum_{b=1}^{B} T_b(\mathbf{x})
+$$
+
+where $T_b$ is the $b$-th decision tree trained on a bootstrap sample. We use the
+`randomForest` package with:
+
+- **Number of trees:** 500
+- **Variables tried per split (mtry):** default ($\lfloor\sqrt{p}\rfloor$)
+- **Minimum node size:** 10
+
+The correlation heatmap above summarizes the predictors used in both models. The three temperature 
+variables (`tmpc`, `tmax`, `tmin`) share correlations of **.97–.99**, creating 
+multicollinearity that destabilizes logistic regression coefficients — random forest 
+handles this naturally through **feature subsampling** at each split. The strong 
+correlation between `centroid_lon` and `frac_shrub` (r = -.51) reflects a 
+**West-East ecological gradient** where fire risk transitions sharply near the 100th 
+meridian, a geographic threshold that a linear decision boundary cannot capture. 
+The lagged fire history variables (`fire_roll3`, `fire_roll6`, `fire_roll12`) encode 
+**path dependency** — counties that have burned repeatedly are structurally more 
+fire-prone, and random forest can condition on these rolling histories jointly with 
+climate and land cover. Together, these structural features of the data make random 
+forest the natural second model.
+
+---
+
+# Model Fitting and Validation
+
+## Time-Aware Expanding-Window Cross-Validation
+
+To respect the temporal structure of the data and avoid data leakage, we use an
+**expanding-window** validation scheme:
+
+- For each fold with training cutoff year $t$: train on all years $\leq t$, validate on year $t+1$
+- Minimum training window: 5 years (to ensure sufficient data before first evaluation)
+- This mirrors real-world deployment: the model only ever sees past data
+
+Setup
+```{r}
+#| label: cv-setup
+
+years_sorted    <- sort(unique(model_df$year))
+min_train_years <- 5
+
+fold_years <- tibble(
+  train_end_year = years_sorted[min_train_years:(length(years_sorted) - 1)],
+  valid_year     = years_sorted[(min_train_years + 1):length(years_sorted)]
+)
+
+#Downsample majority class to 5x minority per fold
+downsample_train <- function(df, ratio = 5) {
+  fire    <- df %>% filter(y_next == 1)
+  no_fire <- df %>% filter(y_next == 0) %>% slice_sample(n = min(nrow(.), nrow(fire) * ratio))
+  bind_rows(fire, no_fire)
+}
+```
+
+Logistic Regression
+```{r}
+#| label: cv-glm
+#| cache: true
+
+auc_glm_vec <- map2_dbl(fold_years$train_end_year, fold_years$valid_year,
+  function(tr_end, va_year) {
+    train <- model_df %>% filter(year <= tr_end) %>% downsample_train()  # NEW
+    valid <- model_df %>% filter(year == va_year)
+    fit   <- glm(feat_formula, data = train, family = binomial())
+    p_hat <- predict(fit, newdata = valid, type = "response")
+    roc_obj <- roc(response  = as.integer(valid[[target]]) - 1L,
+                   predictor = p_hat, quiet = TRUE)
+    as.numeric(auc(roc_obj))
+  })
+```
+
+Random Forest
+```{r}
+#| label: cv-rf
+#| cache: true
+
+n_cores <- max(1L, parallel::detectCores() - 1L)
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+auc_rf_vec <- foreach(
+  i         = seq_len(nrow(fold_years)),
+  .combine  = c,
+  .packages = c("dplyr", "randomForest", "pROC"),
+  .export   = c("model_df", "feat_formula", "target", "downsample_train")  # NEW
+) %dopar% {
+  tr_end  <- fold_years$train_end_year[i]
+  va_year <- fold_years$valid_year[i]
+  train   <- model_df %>% filter(year <= tr_end) %>% downsample_train()  # NEW
+  valid   <- model_df %>% filter(year == va_year)
+  rf <- randomForest(feat_formula,
+                     data     = train,
+                     ntree    = 500,
+                     nodesize = 10)
+  p_hat   <- predict(rf, newdata = valid, type = "prob")[, "1"]
+  roc_obj <- roc(response  = as.integer(valid[[target]]) - 1L,
+                 predictor = p_hat, quiet = TRUE)
+  as.numeric(auc(roc_obj))
+}
+
+stopCluster(cl)
+registerDoSEQ()
+
+fold_results <- fold_years %>%
+  mutate(auc_glm = auc_glm_vec,
+         auc_rf  = auc_rf_vec)
+
+fold_results
+```
+
+
+## AUC by Validation Year (Diagnostic Plot)
+
+```{r}
+#| label: auc-plot
+#| fig-cap: "Time-aware cross-validation AUC for logistic regression and random forest models across validation years (1997–2014). Both models achieve AUC substantially above 0.5 (chance), with the random forest consistently matching or outperforming logistic regression. Performance variation across years reflects year-to-year differences in fire conditions — notably lower AUC in years with atypical fire seasons."
+
+fold_long <- fold_results %>%
+  pivot_longer(
+    cols      = c(auc_glm, auc_rf),
+    names_to  = "model",
+    values_to = "auc"
+  ) %>%
+  mutate(model = recode(model,
+    auc_glm = "Logistic Regression",
+    auc_rf  = "Random Forest"
+  ))
+
+ggplot(fold_long, aes(x = valid_year, y = auc, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = 0.5, linetype = "dashed",
+             color = "grey50", linewidth = 0.7) +
+  annotate("text", x = min(fold_long$valid_year) + 0.3,
+           y = 0.51, label = "Chance (AUC = 0.5)",
+           hjust = 0, size = 3, color = "grey40") +
+  scale_color_manual(values = c("Logistic Regression" = "steelblue",
+                                "Random Forest"       = "darkorange")) +
+  scale_y_continuous(limits = c(0.4, 1.0)) +
+  labs(
+    title    = "Time-Aware Cross-Validation: AUC by Validation Year",
+    subtitle = "Expanding window — trained on all years ≤ t, validated on year t+1",
+    x        = "Validation year",
+    y        = "AUC",
+    color    = "Model"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Summary Performance Table
+
+```{r}
+#| label: performance-table
+
+fold_results %>%
+  summarise(
+    across(c(auc_glm, auc_rf),
+           list(mean = mean, sd = sd, min = min, max = max))
+  ) %>%
+  pivot_longer(everything(),
+               names_to  = c("model", "stat"),
+               names_sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(
+    model = recode(model,
+      auc_glm = "Logistic Regression",
+      auc_rf  = "Random Forest"
+    ),
+    across(c(mean, sd, min, max), ~ round(.x, 4))
+  ) %>%
+  rename(Model = model, `Mean AUC` = mean, `SD` = sd,
+         `Min AUC` = min, `Max AUC` = max) %>%
+  knitr::kable(caption = "Cross-validated AUC summary across all validation folds")
+```
+
+## ROC Curves (Final Held-Out Year)
+
+```{r}
+#| label: roc-final
+#| fig-cap: "ROC curves for logistic regression and random forest evaluated on the final held-out year (2015), trained on all prior years. The diagonal represents chance-level performance."
+
+final_train_year <- max(years_sorted) - 1
+final_test_year  <- max(years_sorted)
+
+train_final <- model_df %>% 
+  filter(year <= final_train_year) %>%
+  downsample_train()                  # ← add downsampling here
+
+test_final  <- model_df %>% filter(year == final_test_year)
+
+# GLM
+fit_glm_final  <- glm(feat_formula, data = train_final, family = binomial())
+p_glm_final    <- predict(fit_glm_final, newdata = test_final, type = "response")
+roc_glm_final  <- roc(as.integer(test_final[[target]]) - 1L,
+                      p_glm_final, quiet = TRUE)
+
+# Random Forest
+fit_rf_final   <- randomForest(feat_formula,
+                               data     = train_final,
+                               ntree    = 500,
+                               nodesize = 10)
+p_rf_final     <- predict(fit_rf_final, newdata = test_final, type = "prob")[, "1"]
+roc_rf_final   <- roc(as.integer(test_final[[target]]) - 1L,
+                      p_rf_final, quiet = TRUE)
+
+# Plot
+roc_glm_df <- data.frame(
+  fpr   = 1 - roc_glm_final$specificities,
+  tpr   = roc_glm_final$sensitivities,
+  model = paste0("Logistic Regression (AUC = ",
+                 round(auc(roc_glm_final), 3), ")")
+)
+roc_rf_df <- data.frame(
+  fpr   = 1 - roc_rf_final$specificities,
+  tpr   = roc_rf_final$sensitivities,
+  model = paste0("Random Forest (AUC = ",
+                 round(auc(roc_rf_final), 3), ")")
+)
+bind_rows(roc_glm_df, roc_rf_df) %>%
+  ggplot(aes(x = fpr, y = tpr, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("steelblue", "darkorange")) +
+  labs(
+    title    = paste0("ROC Curves — Final Held-Out Year (",
+                      final_test_year, ")"),
+    subtitle = paste0("Trained on ", min(years_sorted), "–",
+                      final_train_year),
+    x        = "False Positive Rate",
+    y        = "True Positive Rate",
+    color    = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+```
+
+---
+
+# Summary
+
+## Key EDA Findings
+
+Exploratory analysis revealed three dominant patterns in U.S. wildfire incidence:
+
+1. **Geographic concentration**: Notable fires are heavily concentrated in counties
+   with dense conifer and evergreen forest cover that experience prolonged dry seasons —
+   particularly California, the Pacific Northwest, and the Rocky Mountain states. These
+   counties share a critical combination: high fuel loads from continuous forest canopy
+   and chronic moisture deficits that dry that fuel to ignition thresholds by mid-summer.
+   A secondary cluster appears across the Southeast, especially Florida and Georgia,
+   where pine flatwoods and frequent spring drought create a distinct but less intense
+   fire regime.
+
+2. **Strong seasonality**: Fire incidence peaks sharply in summer (June–July), driven
+   by the seasonal drying cycle in heavily forested western counties where snowmelt
+   transitions rapidly into months of near-zero precipitation. Annual fire rates have
+   trended upward since the early 2000s, with the most extreme years (2006 and 2012)
+   coinciding with documented nationwide drought events that pushed already-dry forested
+   counties past critical fuel moisture thresholds.
+
+3. **Climate signal**: Fire county-months show substantially higher temperatures and
+   lower PDSI than no-fire county-months, while precipitation distributions overlap
+   considerably between the two groups, suggesting that accumulated moisture deficit
+   over prior months matters far more than any single month's rainfall. This is
+   consistent with the forested fire regime: forests accumulate fuel year-round, and
+   it is the depth and duration of seasonal drying that
+   determines whether that fuel ignites at scale.
+
+## Model Performance
+
+Both models achieve meaningful predictive performance above chance across all validation
+years. The **random forest** outperforms logistic regression with a mean cross-validated
+AUC of **0.9025** (SD = 0.03) compared to **0.8211** (SD = 0.05) for logistic
+regression — a gap of roughly 8 AUC points that reflects the random forest's ability
+to exploit correlated predictors, geographic thresholds, and lagged fire history
+jointly. The random forest also shows greater consistency across validation folds,
+with a higher minimum AUC of **0.7948** versus **0.6796** for logistic regression,
+suggesting it degrades less severely in atypical fire years.
+
+The **logistic regression** baseline remains competitive and offers a key practical
+advantage: coefficient interpretability. Its performance show that the chosen
+predictors carry genuine predictive signal and that the modeling setup is sound.
+
+## Limitations and Future Directions
+
+The current model operates at the county-month level, which aggregates considerable
+spatial heterogeneity within large western counties, a particular limitation given
+that fire risk within a single large forested county can vary dramatically by
+elevation, aspect, and distance from roads. Finer spatial resolution (e.g., grid
+cells) or inclusion of topographic variables (slope, aspect, elevation) could
+substantially improve performance in these high-risk forested regions. Additionally,
+ignition sources (lightning vs. human) are not included as predictors; human ignition
+risk covaries with proximity to roads and population density, which future work could
+incorporate. Vapor Pressure Deficit (VPD), considered by modern fire science as a
+strong meteorological predictor of fire weather in forested landscapes,
+is also absent from the current feature set and represents the highest-value addition
+for future modeling efforts.

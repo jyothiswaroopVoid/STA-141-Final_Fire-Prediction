@@ -1,0 +1,314 @@
+---
+title: "County_Climate_Extraction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+# =============================================================================
+# NOAA nClimDiv County + Division Monthly Climate Data Downloader
+# Source: https://www.ncei.noaa.gov/pub/data/cirs/climdiv/
+#
+# County-level variables (3,107 counties, 1895-present):
+#   tmpc  - average temperature (deg F)
+#   tmax  - maximum temperature (deg F)
+#   tmin  - minimum temperature (deg F)
+#   pcpn  - precipitation (inches)
+#
+# Division-level variables (344 divisions, 1895-present):
+#   pdsi  - Palmer Drought Severity Index
+#
+# IMPORTANT: NOAA uses its own 2-digit state codes (01=AL, 02=AZ, 03=AR...)
+# which differ from Census FIPS (01=AL, 02=AK, 04=AZ...).
+# This script maps NOAA codes to Census FIPS for county data,
+# and builds a county-to-division crosswalk for joining PDSI.
+# =============================================================================
+
+library(tidyverse)
+
+# --- Configuration -----------------------------------------------------------
+BASE_URL <- "https://www.ncei.noaa.gov/pub/data/cirs/climdiv/"
+OUT_DIR  <- "noaa_county_temps"
+dir.create(OUT_DIR, showWarnings = FALSE)
+
+# County-level files
+COUNTY_FILES <- c(
+  tmpc = "climdiv-tmpccy",   # average temperature
+  tmax = "climdiv-tmaxcy",   # maximum temperature
+  tmin = "climdiv-tmincy",   # minimum temperature
+  pcpn = "climdiv-pcpncy"    # precipitation
+)
+
+# Division-level files
+DIVISION_FILES <- c(
+  pdsi = "climdiv-pdsidv"    # Palmer Drought Severity Index
+)
+
+# --- NOAA state code to Census state FIPS mapping ----------------------------
+# NOAA codes 01-50 are alphabetical order — NOT the same as Census FIPS
+# Source: NOAA county-readme.txt and divisional-readme.txt STATE CODE TABLE
+NOAA_STATE_FIPS <- tibble(
+  noaa_code  = sprintf("%02d", 1:50),
+  state_name = c(
+    "Alabama","Arizona","Arkansas","California","Colorado",
+    "Connecticut","Delaware","Florida","Georgia","Idaho",
+    "Illinois","Indiana","Iowa","Kansas","Kentucky",
+    "Louisiana","Maine","Maryland","Massachusetts","Michigan",
+    "Minnesota","Mississippi","Missouri","Montana","Nebraska",
+    "Nevada","New Hampshire","New Jersey","New Mexico","New York",
+    "North Carolina","North Dakota","Ohio","Oklahoma","Oregon",
+    "Pennsylvania","Rhode Island","South Carolina","South Dakota","Tennessee",
+    "Texas","Utah","Vermont","Virginia","Washington",
+    "West Virginia","Wisconsin","Wyoming","Hawaii","Alaska"
+  ),
+  state_fips = c(
+    "01","04","05","06","08",
+    "09","10","12","13","16",
+    "17","18","19","20","21",
+    "22","23","24","25","26",
+    "27","28","29","30","31",
+    "32","33","34","35","36",
+    "37","38","39","40","41",
+    "42","44","45","46","47",
+    "48","49","50","51","53",
+    "54","55","56","15","02"
+  )
+)
+
+# --- Helper: find latest versioned filename on NOAA server -------------------
+get_latest_filename <- function(prefix) {
+  page <- tryCatch(readLines(BASE_URL, warn = FALSE), error = function(e) NULL)
+  if (is.null(page)) stop("Could not reach NOAA server.")
+  pattern <- paste0(prefix, "-v[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]{8}")
+  matches <- unique(unlist(regmatches(page, gregexpr(pattern, page))))
+  if (length(matches) == 0) stop(paste("No file found for prefix:", prefix))
+  tail(sort(matches), 1)
+}
+
+# --- Helper: download file if not already cached ----------------------------
+download_if_needed <- function(filename) {
+  dest <- file.path(OUT_DIR, filename)
+  if (!file.exists(dest)) {
+    message("Downloading: ", filename)
+    download.file(paste0(BASE_URL, filename), destfile = dest, mode = "wb", quiet = TRUE)
+  } else {
+    message("Already cached: ", filename)
+  }
+  dest
+}
+
+# --- Helper: parse county-level file ----------------------------------------
+# Format:
+#   Cols  1-2  : NOAA state code (01-50, alphabetical — NOT Census FIPS)
+#   Cols  3-5  : County FIPS within state (3-digit, matches Census)
+#   Cols  6-7  : Element code (ignored)
+#   Cols  8-11 : Year
+#   Cols 12-95 : 12 monthly values, 7 chars each (f7.2)
+#
+# Temperature: degrees F. Missing = -9999.00 or -99.99
+# Precipitation: inches.  Missing = -9.99
+parse_county_file <- function(filepath, var_name) {
+  message("Parsing county file: ", basename(filepath))
+
+  is_precip <- var_name == "pcpn"
+
+  read_fwf(
+    filepath,
+    col_positions = fwf_widths(
+      c(2, 3, 2, 4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7),
+      c("noaa_code","county3","elem_code","year",
+        "Jan","Feb","Mar","Apr","May","Jun",
+        "Jul","Aug","Sep","Oct","Nov","Dec")
+    ),
+    col_types = cols(
+      noaa_code = col_character(),
+      county3   = col_character(),
+      elem_code = col_character(),
+      year      = col_integer(),
+      .default  = col_double()
+    )
+  ) %>%
+    left_join(NOAA_STATE_FIPS, by = "noaa_code") %>%
+    filter(!is.na(state_fips)) %>%
+    mutate(
+      county_fips = paste0(state_fips, str_pad(county3, 3, pad = "0")),
+      # Replace missing sentinels with NA
+      # Temp sentinel: -99.99 or -9999.00; Precip sentinel: -9.99
+      across(Jan:Dec, ~ ifelse(
+        if (is_precip) . <= -9.00 else . <= -99.00,
+        NA_real_, .
+      ))
+    ) %>%
+    select(county_fips, state_name, year, Jan:Dec) %>%
+    pivot_longer(Jan:Dec, names_to = "month", values_to = var_name) %>%
+    mutate(
+      month_num = match(month, month.abb),
+      date      = as.Date(paste(year, month_num, "01"), "%Y %m %d")
+    ) %>%
+    select(county_fips, state_name, year, month_num, month, date, all_of(var_name))
+}
+
+# --- Helper: parse division-level file (for PDSI) ----------------------------
+# Format:
+#   Cols  1-4  : NOAA state code (2 digits) + division number (2 digits)
+#   Cols  5-6  : Element code (ignored)
+#   Cols  7-10 : Year
+#   Cols 11-94 : 12 monthly values, 7 chars each (f7.2)
+#
+# PDSI range: approx -10 (extreme drought) to +10 (extreme wet). Missing = -99.99
+parse_division_file <- function(filepath, var_name) {
+  message("Parsing division file: ", basename(filepath))
+
+  read_fwf(
+    filepath,
+    col_positions = fwf_widths(
+      c(2, 2, 2, 4, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7),
+      c("noaa_code","division","elem_code","year",
+        "Jan","Feb","Mar","Apr","May","Jun",
+        "Jul","Aug","Sep","Oct","Nov","Dec")
+    ),
+    col_types = cols(
+      noaa_code = col_character(),
+      division  = col_character(),
+      elem_code = col_character(),
+      year      = col_integer(),
+      .default  = col_double()
+    )
+  ) %>%
+    left_join(NOAA_STATE_FIPS, by = "noaa_code") %>%
+    filter(!is.na(state_fips)) %>%
+    mutate(
+      # Build a division ID: state FIPS + 2-digit division number
+      division_id = paste0(state_fips, str_pad(division, 2, pad = "0")),
+      across(Jan:Dec, ~ ifelse(. <= -99.00, NA_real_, .))
+    ) %>%
+    select(division_id, state_name, year, Jan:Dec) %>%
+    pivot_longer(Jan:Dec, names_to = "month", values_to = var_name) %>%
+    mutate(
+      month_num = match(month, month.abb),
+      date      = as.Date(paste(year, month_num, "01"), "%Y %m %d")
+    ) %>%
+    select(division_id, state_name, year, month_num, month, date, all_of(var_name))
+}
+
+# =============================================================================
+# STEP 1: Download and parse county-level data
+# =============================================================================
+
+county_data <- list()
+
+for (var in names(COUNTY_FILES)) {
+  prefix   <- COUNTY_FILES[[var]]
+  filename <- get_latest_filename(prefix)
+  filepath <- download_if_needed(filename)
+  county_data[[var]] <- parse_county_file(filepath, var)
+}
+
+# Merge all county variables
+message("Merging county variables...")
+county_df <- county_data[["tmpc"]] %>%
+  left_join(county_data[["tmax"]] %>% select(county_fips, year, month_num, tmax),
+            by = c("county_fips","year","month_num")) %>%
+  left_join(county_data[["tmin"]] %>% select(county_fips, year, month_num, tmin),
+            by = c("county_fips","year","month_num")) %>%
+  left_join(county_data[["pcpn"]] %>% select(county_fips, year, month_num, pcpn),
+            by = c("county_fips","year","month_num")) %>%
+  arrange(county_fips, date) %>%
+  select(county_fips, state_name, year, month_num, month, date, tmpc, tmax, tmin, pcpn)
+
+# =============================================================================
+# STEP 2: Download and parse division-level PDSI
+# =============================================================================
+
+division_data <- list()
+
+for (var in names(DIVISION_FILES)) {
+  prefix   <- DIVISION_FILES[[var]]
+  filename <- get_latest_filename(prefix)
+  filepath <- download_if_needed(filename)
+  division_data[[var]] <- parse_division_file(filepath, var)
+}
+
+pdsi_df <- division_data[["pdsi"]]
+
+# =============================================================================
+# STEP 3: Build county-to-division crosswalk and join PDSI onto county data
+#
+# NOAA provides a crosswalk at:
+# https://www.ncei.noaa.gov/pub/data/cirs/climdiv/county-to-climdivs.txt
+# We download it here and use it to map each county to its climate division.
+# =============================================================================
+
+message("Downloading county-to-division crosswalk...")
+crosswalk_url  <- paste0(BASE_URL, "county-to-climdivs.txt")
+crosswalk_file <- file.path(OUT_DIR, "county-to-climdivs.txt")
+
+if (!file.exists(crosswalk_file)) {
+  download.file(crosswalk_url, destfile = crosswalk_file, mode = "wb", quiet = TRUE)
+}
+
+# File format (from previewing county-to-climdivs.txt):
+# 2-line header, then space-delimited columns:
+#   POSTAL_FIPS_ID  NCDC_FIPS_ID  CLIMDIV_ID
+# e.g.: 01033  01033  0101
+# POSTAL_FIPS_ID = standard 5-digit Census county FIPS
+# CLIMDIV_ID     = 4-digit: first 2 = NOAA state code, last 2 = division number
+
+crosswalk <- read_table(
+  crosswalk_file,
+  col_names = c("county_fips", "ncdc_fips", "climdiv_id"),
+  col_types = cols(.default = col_character()),
+  skip = 2   # skip 2-line header
+) %>%
+  # Map NOAA state code (first 2 chars of climdiv_id) to Census state FIPS
+  mutate(
+    noaa_code   = str_sub(climdiv_id, 1, 2),
+    division_num = str_sub(climdiv_id, 3, 4)
+  ) %>%
+  left_join(NOAA_STATE_FIPS %>% select(noaa_code, state_fips), by = "noaa_code") %>%
+  filter(!is.na(state_fips)) %>%
+  mutate(
+    division_id = paste0(state_fips, division_num)
+  ) %>%
+  select(county_fips, division_id) %>%
+  distinct()
+
+message("Crosswalk: ", nrow(crosswalk), " county-division mappings")
+
+# Join PDSI onto county data via crosswalk
+message("Joining PDSI to county data...")
+county_climate <- county_df %>%
+  left_join(crosswalk, by = "county_fips") %>%
+  left_join(
+    pdsi_df %>% select(division_id, year, month_num, pdsi),
+    by = c("division_id", "year", "month_num")
+  ) %>%
+  select(county_fips, state_name, division_id, year, month_num, month, date,
+         tmpc, tmax, tmin, pcpn, pdsi)
+
+# =============================================================================
+# SUMMARY AND SAVE
+# =============================================================================
+
+message("\nDone! Preview:")
+print(head(county_climate, 10))
+message("\nTotal rows  : ", nrow(county_climate))
+message("Counties    : ", n_distinct(county_climate$county_fips))
+message("Years       : ", min(county_climate$year), " - ", max(county_climate$year))
+message("Temp range  : ", round(min(county_climate$tmpc, na.rm=TRUE),1),
+        " to ", round(max(county_climate$tmpc, na.rm=TRUE),1), " deg F")
+message("Precip range: ", round(min(county_climate$pcpn, na.rm=TRUE),2),
+        " to ", round(max(county_climate$pcpn, na.rm=TRUE),2), " inches")
+message("PDSI range  : ", round(min(county_climate$pdsi, na.rm=TRUE),2),
+        " to ", round(max(county_climate$pdsi, na.rm=TRUE),2))
+message("PDSI NAs    : ", sum(is.na(county_climate$pdsi)),
+        " (", round(mean(is.na(county_climate$pdsi))*100,1), "%)")
+
+out_csv <- file.path(OUT_DIR, "county_climate_1895_present.csv")
+write_csv(county_climate, out_csv)
+message("\nSaved to: ", out_csv)
+```

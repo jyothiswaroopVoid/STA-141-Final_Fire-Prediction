@@ -1,0 +1,8 @@
+*.sqlite
+county_climate_1990_2016.csv
+nlcd_county_1992_2015.csv
+*_cache/
+*_files/
+.Rhistory
+.RData
+.Rproj.user
